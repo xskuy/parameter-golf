@@ -59,13 +59,13 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape.
+    # Model shape (depth-recurrent with SwiGLU).
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", 3))
+    num_repeats = int(os.environ.get("NUM_REPEATS", 3))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -73,10 +73,10 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.015))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.013))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.013))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -289,7 +289,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,layer_attn_scales,layer_mlp_scales,layer_resid_mixes",
     ).split(",")
     if pattern
 )
@@ -603,57 +603,52 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
-class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+class SwiGLUMLP(nn.Module):
+    # SwiGLU: gate(x) * up(x) -> down. ~8/3 expansion for param parity with 2x relu^2.
+    def __init__(self, dim: int):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        hidden = int(dim * 8 / 3)
+        hidden = (hidden // 64) * 64
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.up = CastedLinear(dim, hidden, bias=False)
+        self.down = CastedLinear(hidden, dim, bias=False)
+        self.down._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    # Shared transformer block. Per-loop specialization via external gate scalars.
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.mlp = SwiGLUMLP(dim)
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+    def forward(self, x: Tensor, x0: Tensor,
+                attn_scale: Tensor, mlp_scale: Tensor, resid_mix: Tensor) -> Tensor:
+        mix = resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
 class GPT(nn.Module):
+    # Depth-recurrent transformer: shared blocks repeated multiple times.
+    # Per-virtual-layer gate scalars provide specialization without duplicating blocks.
+    # Informed by Two-Scale Latent Dynamics (ICLR 2026).
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
+        num_unique_blocks: int,
+        num_repeats: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -666,25 +661,31 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_unique_blocks = num_unique_blocks
+        self.num_repeats = num_repeats
+        self.num_virtual_layers = num_unique_blocks * num_repeats
+
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+            for _ in range(num_unique_blocks)
+        ])
         self.final_norm = RMSNorm()
+
+        # Per-virtual-layer gate scalars and residual mixing (NOT shared with blocks).
+        self.layer_attn_scales = nn.ParameterList([
+            nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+            for _ in range(self.num_virtual_layers)
+        ])
+        self.layer_mlp_scales = nn.ParameterList([
+            nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+            for _ in range(self.num_virtual_layers)
+        ])
+        self.layer_resid_mixes = nn.ParameterList([
+            nn.Parameter(torch.stack((torch.ones(model_dim), torch.zeros(model_dim))).float())
+            for _ in range(self.num_virtual_layers)
+        ])
+
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -701,16 +702,15 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for v in range(self.num_virtual_layers):
+            block_idx = v % self.num_unique_blocks
+            x = self.blocks[block_idx](
+                x, x0,
+                attn_scale=self.layer_attn_scales[v],
+                mlp_scale=self.layer_mlp_scales[v],
+                resid_mix=self.layer_resid_mixes[v],
+            )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -825,11 +825,11 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        num_unique_blocks=args.num_unique_blocks,
+        num_repeats=args.num_repeats,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -847,7 +847,7 @@ def main() -> None:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
+    # - vectors/scalars + per-layer gates use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -859,8 +859,10 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # Per-layer gate scalars and resid mixes (outside blocks).
+    for pl in [base_model.layer_attn_scales, base_model.layer_mlp_scales, base_model.layer_resid_mixes]:
+        for p in pl:
+            scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -894,6 +896,10 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(
+        f"architecture:depth_recurrent unique_blocks:{args.num_unique_blocks} "
+        f"repeats:{args.num_repeats} virtual_layers:{base_model.num_virtual_layers}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
