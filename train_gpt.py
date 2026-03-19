@@ -763,10 +763,18 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # Flash SDP requires SM80+ (A100/H100). Fall back to math SDP on older GPUs (T4).
+    sm_major = torch.cuda.get_device_capability(device)[0]
+    if sm_major >= 8:
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(True)
+        enable_mem_efficient_sdp(False)
+        enable_math_sdp(False)
+    else:
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(False)
+        enable_mem_efficient_sdp(True)
+        enable_math_sdp(True)
 
     logfile = None
     if master_process:
