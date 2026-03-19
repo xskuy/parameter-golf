@@ -48,6 +48,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -263,6 +264,8 @@ def eval_val(
     seq_len = args.train_seq_len
     stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
     total_tokens_available = val_tokens.numel() - 1
+    local_batch_tokens = max(args.val_batch_size // max(world_size * grad_accum_steps, 1), seq_len)
+    windows_per_batch = max(local_batch_tokens // seq_len, 1)
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -282,32 +285,37 @@ def eval_val(
 
     model.eval()
     with torch.inference_mode():
-        for win_start, win_end in rank_windows:
-            chunk = val_tokens[win_start:win_end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = chunk[:-1].unsqueeze(0)  # (1, seq_len)
-            y = chunk[1:]               # (seq_len,)
+        for batch_start in range(0, len(rank_windows), windows_per_batch):
+            batch_windows = rank_windows[batch_start : batch_start + windows_per_batch]
+            chunk_batch = torch.stack([
+                val_tokens[win_start:win_end + 1]
+                for win_start, win_end in batch_windows
+            ]).to(device=device, dtype=torch.int64, non_blocking=True)
+            x = chunk_batch[:, :-1]  # (batch, seq_len)
+            y = chunk_batch[:, 1:]   # (batch, seq_len)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = forward_logits(model, x).squeeze(0).float()  # (seq_len, vocab)
+                logits = forward_logits(model, x).float()  # (batch, seq_len, vocab)
 
-            # Only score the last `stride` tokens (the rest is context).
-            # For the first window, score everything.
-            score_start = 0 if win_start == 0 else seq_len - stride
-            scored_logits = logits[score_start:]
-            scored_targets = y[score_start:]
-            per_token_loss = F.cross_entropy(scored_logits, scored_targets, reduction='none')
-            chunk_loss_sum = per_token_loss.to(torch.float64).sum()
-            chunk_count = float(scored_targets.numel())
+            for batch_idx, (win_start, _) in enumerate(batch_windows):
+                # Only score the last `stride` tokens (the rest is context).
+                # For the first window, score everything.
+                score_start = 0 if win_start == 0 else seq_len - stride
+                scored_logits = logits[batch_idx, score_start:]
+                scored_targets = y[batch_idx, score_start:]
+                per_token_loss = F.cross_entropy(scored_logits, scored_targets, reduction='none')
+                chunk_loss_sum = per_token_loss.to(torch.float64).sum()
+                chunk_count = float(scored_targets.numel())
 
-            val_loss_sum += chunk_loss_sum
-            val_token_count += chunk_count
+                val_loss_sum += chunk_loss_sum
+                val_token_count += chunk_count
 
-            # Byte counting for bpb.
-            prev_ids = chunk[score_start:-1]
-            tgt_ids = scored_targets
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+                # Byte counting for bpb.
+                prev_ids = chunk_batch[batch_idx, score_start:-1]
+                tgt_ids = scored_targets
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -1028,7 +1036,11 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (
+            args.val_loss_every > 0
+            and step % args.val_loss_every == 0
+            and (step > 0 or args.validate_at_step_zero)
+        )
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
