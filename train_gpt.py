@@ -35,6 +35,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+#
+# Hybrid score-first experiment profiles:
+# - local_hybrid_smoke_v1:
+#   NUM_UNIQUE_BLOCKS=10 NUM_REPEATS=1 MODEL_DIM=512 MLP_MULT_NUM=3
+#   TRAIN_SEQ_LEN=2048 EVAL_SEQ_LEN=2048 TRAIN_BATCH_TOKENS=786432
+#   MATRIX_LR=0.02 SCALAR_LR=0.02 TIED_EMBED_LR=0.03
+#   MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 MUON_MOMENTUM_WARMUP_STEPS=1500
+#   GRAD_CLIP_NORM=0.3 WARMDOWN_ITERS=3000 EVAL_STRIDE=512
+#   INT8_KEEP_FLOAT_NAME_PATTERNS=tok_emb.weight VAL_MAX_BATCHES=64 ROUNDTRIP_EVAL=0
+# - submission_hybrid_v1:
+#   same as local_hybrid_smoke_v1, but VAL_MAX_BATCHES=0 ROUNDTRIP_EVAL=1
+#   ROUNDTRIP_VAL_MAX_BATCHES=0 MAX_WALLCLOCK_SECONDS=600
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -48,6 +60,9 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_max_batches = int(os.environ.get("VAL_MAX_BATCHES", 0))
+    roundtrip_eval = bool(int(os.environ.get("ROUNDTRIP_EVAL", "1")))
+    roundtrip_val_max_batches = int(os.environ.get("ROUNDTRIP_VAL_MAX_BATCHES", val_max_batches))
     validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
@@ -57,6 +72,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -73,9 +89,10 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     # Sliding window eval: stride < seq_len gives overlapping windows, free bpb improvement.
     eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
-    # Quantization bits: 8 for int8 (default), 6 for int6 (smaller artifact).
-    weight_quant_bits = int(os.environ.get("WEIGHT_QUANT_BITS", 6))
+    # Quantization bits: int8 is the accuracy-first default, with optional selective int6 overrides.
+    weight_quant_bits = int(os.environ.get("WEIGHT_QUANT_BITS", 8))
     embed_quant_bits = int(os.environ.get("EMBED_QUANT_BITS", 8))
+    lowbit_bits = int(os.environ.get("LOWBIT_BITS", 6))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -91,6 +108,10 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
+    head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", 0.0))
+    matrix_weight_decay = float(os.environ.get("MATRIX_WEIGHT_DECAY", 0.0))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
@@ -117,10 +138,24 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        weight_decay: float = 0.0,
+        nesterov: bool = True,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                weight_decay=weight_decay,
+                nesterov=nesterov,
+            ),
         )
 
     @torch.no_grad()
@@ -141,6 +176,7 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
+            weight_decay = group["weight_decay"]
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
@@ -169,6 +205,8 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if weight_decay != 0.0 and p.grad is not None:
+                    p.add_(p, alpha=-lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -219,7 +257,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
-        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+        raise ValueError(f"Validation split is too short for EVAL_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
 
 
@@ -257,11 +295,12 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    val_max_batches: int = 0,
 ) -> tuple[float, float]:
     # Sliding window evaluation: use overlapping windows for better context.
     # stride < seq_len means each token (except the first window) gets predicted
     # with more context than flat evaluation. Free bpb improvement (~0.03).
-    seq_len = args.train_seq_len
+    seq_len = args.eval_seq_len
     stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
     total_tokens_available = val_tokens.numel() - 1
     local_batch_tokens = max(args.val_batch_size // max(world_size * grad_accum_steps, 1), seq_len)
@@ -285,7 +324,10 @@ def eval_val(
 
     model.eval()
     with torch.inference_mode():
+        batches_seen = 0
         for batch_start in range(0, len(rank_windows), windows_per_batch):
+            if val_max_batches > 0 and batches_seen >= val_max_batches:
+                break
             batch_windows = rank_windows[batch_start : batch_start + windows_per_batch]
             chunk_batch = torch.stack([
                 val_tokens[win_start:win_end + 1]
@@ -316,6 +358,7 @@ def eval_val(
                 token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
                 token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
                 val_byte_count += token_bytes.to(torch.float64).sum()
+            batches_seen += 1
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -344,12 +387,22 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
         ",".join(CONTROL_TENSOR_NAME_PATTERNS),
     ).split(",")
+    if pattern
+)
+LOWBIT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("LOWBIT_NAME_PATTERNS", "").split(",")
     if pattern
 )
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -361,8 +414,11 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+def matches_any(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+    if matches_any(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -389,7 +445,12 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], weight_bits: int = 8, embed_bits: int = 8):
+def quantize_state_dict_int8(
+    state_dict: dict[str, Tensor],
+    weight_bits: int = 8,
+    embed_bits: int = 8,
+    lowbit_bits: int = 6,
+):
     # Quantize with configurable bits. int6 for weights saves ~25% artifact space.
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -416,6 +477,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], weight_bits: int = 8
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
+        if matches_any(name, INT8_KEEP_FLOAT_NAME_PATTERNS):
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -424,6 +491,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], weight_bits: int = 8
 
         stats["num_float_tensors"] += 1
         bits = embed_bits if "tok_emb" in name else weight_bits
+        if matches_any(name, LOWBIT_NAME_PATTERNS):
+            bits = min(bits, lowbit_bits)
         q, s = quantize_float_tensor(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -867,13 +936,16 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1} "
+        f"eval_seq_len:{args.eval_seq_len} val_max_batches:{args.val_max_batches}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -921,8 +993,13 @@ def main() -> None:
         for p in pl:
             scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+    optimizer_tok = torch.optim.AdamW(
+        [{
+            "params": [base_model.tok_emb.weight],
+            "lr": token_lr,
+            "base_lr": token_lr,
+            "weight_decay": args.embed_weight_decay,
+        }],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -932,19 +1009,30 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.matrix_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+    optimizer_scalar = torch.optim.AdamW(
+        [{
+            "params": scalar_params,
+            "lr": args.scalar_lr,
+            "base_lr": args.scalar_lr,
+            "weight_decay": args.scalar_weight_decay,
+        }],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+        optimizer_head = torch.optim.AdamW(
+            [{
+                "params": [base_model.lm_head.weight],
+                "lr": args.head_lr,
+                "base_lr": args.head_lr,
+                "weight_decay": args.head_weight_decay,
+            }],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -966,9 +1054,19 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"weight_decay embed:{args.embed_weight_decay} head:{args.head_weight_decay} "
+        f"matrix:{args.matrix_weight_decay} scalar:{args.scalar_weight_decay}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"export_config weight_bits:{args.weight_quant_bits} embed_bits:{args.embed_quant_bits} "
+        f"lowbit_bits:{args.lowbit_bits} keep_float:{','.join(INT8_KEEP_FLOAT_NAME_PATTERNS) or 'none'} "
+        f"lowbit_patterns:{','.join(LOWBIT_NAME_PATTERNS) or 'none'} roundtrip_eval:{args.roundtrip_eval}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1055,6 +1153,7 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                val_max_batches=args.val_max_batches,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1141,7 +1240,10 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_int8(
-        base_model.state_dict(), weight_bits=args.weight_quant_bits, embed_bits=args.embed_quant_bits
+        base_model.state_dict(),
+        weight_bits=args.weight_quant_bits,
+        embed_bits=args.embed_quant_bits,
+        lowbit_bits=args.lowbit_bits,
     )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
@@ -1153,39 +1255,58 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
+        total_submission_bytes = quant_file_bytes + code_bytes
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
+        if total_submission_bytes < 10_000_000:
+            log0(
+                "budget_guidance:far_under_budget increase capacity before reintroducing heavier compression "
+                "(prefer NUM_UNIQUE_BLOCKS=11, then MODEL_DIM=576)"
+            )
+        elif total_submission_bytes < 15_000_000:
+            log0(
+                "budget_guidance:under_15mb prefer larger hybrid model before enabling LOWBIT_NAME_PATTERNS "
+                "(NUM_UNIQUE_BLOCKS=11, then MODEL_DIM=576)"
+            )
+        elif total_submission_bytes > 16_000_000:
+            log0("budget_guidance:over_16mb enable selective LOWBIT_NAME_PATTERNS before shrinking the model")
+        else:
+            log0("budget_guidance:artifact_in_target_band continue tuning training and quantization gap")
 
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.roundtrip_eval:
+        if distributed:
+            dist.barrier()
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            val_max_batches=args.roundtrip_val_max_batches,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    else:
+        log0("final_int8_zlib_roundtrip skipped roundtrip_eval:0")
 
     if distributed:
         dist.destroy_process_group()
